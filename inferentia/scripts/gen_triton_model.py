@@ -285,7 +285,7 @@ def get_tensorflow_initialize_impl():
     return init_impl
 
 
-def get_pytorch_initialize_impl():
+def get_pytorch_initialize_impl(disable_data_parallel_mode):
     init_impl = '''
     def _validate_and_get_index(self, name):
         parts = name.split('__')
@@ -342,12 +342,19 @@ def get_pytorch_initialize_impl():
         os.environ["NEURON_RT_VISIBLE_CORES"] = cores_range
 
         consumed_cores_list = [i for i in range(cores_per_instance)]
-
+'''
+    if disable_data_parallel_mode:
+        init_impl += '''
+        self.model_neuron = torch.jit.load(compiled_model)
+'''
+    else:
+        init_impl += '''
         self.model_neuron = torch.neuron.DataParallel(
             torch.jit.load(compiled_model), device_ids=consumed_cores_list)
-        self.model_neuron.num_workers = num_threads
-
 '''
+    init_impl += '''
+        self.model_neuron.num_workers = num_threads
+    '''
     return init_impl
 
 
@@ -469,7 +476,7 @@ def get_tensorflow_execute_impl(disable_batch_requests_to_neuron):
                 full_tensor = np.concatenate(
                     (full_tensor, out_list[idx + 1]), axis=0)
             chuncky_tensors.append(np.split(full_tensor, request_batch_sizes, axis=0))
-        
+
         for i in range(num_requests):
             output_tensors = []
             for j in range(len(self.output_list)):
@@ -592,7 +599,8 @@ def get_finalize_impl():
 
 
 def get_triton_python_model_impl(using_tensorflow_model,
-                                 disable_batch_requests_to_neuron):
+                                 disable_batch_requests_to_neuron,
+                                 disable_data_parallel_mode):
     triton_pmi = '''
 class TritonPythonModel:
     """Your Python model must use the same class name. Every Python model
@@ -605,7 +613,7 @@ class TritonPythonModel:
         triton_pmi += get_tensorflow_execute_impl(
             disable_batch_requests_to_neuron)
     else:
-        triton_pmi += get_pytorch_initialize_impl()
+        triton_pmi += get_pytorch_initialize_impl(disable_data_parallel_mode)
         triton_pmi += get_pytorch_execute_impl(disable_batch_requests_to_neuron)
 
     triton_pmi += get_finalize_impl()
@@ -613,7 +621,8 @@ class TritonPythonModel:
     return triton_pmi
 
 
-def create_model_file(using_tensorflow_model, disable_batch_requests_to_neuron):
+def create_model_file(using_tensorflow_model, disable_batch_requests_to_neuron,
+                      disable_data_parallel_mode):
     triton_model = get_model_license()
     triton_model += '''
 import json
@@ -634,7 +643,8 @@ import torch
 import torch.neuron
     '''
     triton_model += get_triton_python_model_impl(
-        using_tensorflow_model, disable_batch_requests_to_neuron)
+        using_tensorflow_model, disable_batch_requests_to_neuron,
+        disable_data_parallel_mode)
     return triton_model
 
 
@@ -653,41 +663,47 @@ if __name__ == '__main__':
     parser.add_argument(
         '--enable_dynamic_batching',
         action="store_true",
-        help='''Enable dynamic batching. Please see model configuration 
-        documentation for details: 
+        help='''Enable dynamic batching. Please see model configuration
+        documentation for details:
         https://github.com/triton-inference-server/server/blob/main/docs/model_configuration.md#dynamic-batcher'''
     )
     parser.add_argument(
         '--max_batch_size',
         type=int,
         default=0,
-        help='''The maximum batch size for the model being generated. 
-        Please see model configuration documentation for details: 
+        help='''The maximum batch size for the model being generated.
+        Please see model configuration documentation for details:
         https://github.com/triton-inference-server/server/blob/main/docs/model_configuration.md#maximum-batch-size'''
     )
     parser.add_argument('--preferred_batch_size',
                         type=int,
                         help='''The preferred batch size. Should be multiples
         of cores available to ensure proper utilization of
-        neuron cores. 
-        This flag is ignored if --enable_dynamic_batching is 
-        not specified. Please see model configuration 
-        documentation for details: 
+        neuron cores.
+        This flag is ignored if --enable_dynamic_batching is
+        not specified. Please see model configuration
+        documentation for details:
         https://github.com/triton-inference-server/server/blob/main/docs/model_configuration.md#preferred-batch-sizes'''
                        )
     parser.add_argument('--max_queue_delay_microseconds',
                         type=int,
-                        help='''Max queue delay time(ms) for dynamic batching. 
-        This flag is ignored if --enable_dynamic_batching is not specified. 
-        Please see model configuration documentation for details: 
+                        help='''Max queue delay time(ms) for dynamic batching.
+        This flag is ignored if --enable_dynamic_batching is not specified.
+        Please see model configuration documentation for details:
         https://github.com/triton-inference-server/server/blob/main/docs/model_configuration.md#delayed-batching'''
                        )
     parser.add_argument(
         '--disable_batch_requests_to_neuron',
         action="store_true",
         help='''Send each request separately to neuron if enabled.
-                         If not specified, then requests are combined and sent to 
+                         If not specified, then requests are combined and sent to
                          neuron as a single batch''')
+    parser.add_argument('--disable_data_parallel_mode',
+                        action="store_true",
+                        default=False,
+                        help='''Do not run the model in dataparallel mode.
+                        When data parallel mode is disabled, each model is loaded on total_cores // number_of_instances
+                        neuron cores. Useful to reduce latency.  ''')
     parser.add_argument('--tag_set',
                         type=str,
                         default="serve",
@@ -767,12 +783,14 @@ if __name__ == '__main__':
         is_tensorflow_model = False
 
     print('''Triton Dynamic Batching is enabled: {},
-        preferred_batch_size: {} and max_batch_size: {} 
-        with max_queue_delay_microseconds: {}. 
-        Batch requests to neruon are disabled: {}'''.format(
+        preferred_batch_size: {} and max_batch_size: {}
+        with max_queue_delay_microseconds: {}.
+        Batch requests to neruon are disabled: {}
+        Data parallel mode is disabled: {}'''.format(
         FLAGS.enable_dynamic_batching, FLAGS.preferred_batch_size,
         FLAGS.max_batch_size, FLAGS.max_queue_delay_microseconds,
-        FLAGS.disable_batch_requests_to_neuron))
+        FLAGS.disable_batch_requests_to_neuron,
+        FLAGS.disable_data_parallel_mode))
 
     if not is_tensorflow_model or (FLAGS.triton_input != None and
                                    FLAGS.triton_output != None):
@@ -802,6 +820,7 @@ if __name__ == '__main__':
         config_file.write(mc)
 
     mf = create_model_file(is_tensorflow_model,
-                           FLAGS.disable_batch_requests_to_neuron)
+                           FLAGS.disable_batch_requests_to_neuron,
+                           FLAGS.disable_data_parallel_mode)
     with open(FLAGS.triton_model_dir + "/1/model.py", "w") as model_file:
         model_file.write(mf)
